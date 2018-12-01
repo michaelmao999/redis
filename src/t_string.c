@@ -64,6 +64,104 @@ static int checkStringLength(client *c, long long size) {
 #define OBJ_SET_EX (1<<2)     /* Set if time in seconds is given */
 #define OBJ_SET_PX (1<<3)     /* Set if time in ms in given */
 
+void compareAndSetGenericCommand(client *c, long long expectedValue, long long newValue) {
+    long long oldvalue;
+    robj *o, *new;
+
+    o = lookupKeyWrite(c->db,c->argv[1]);
+    if (o != NULL && checkType(c,o,OBJ_STRING)) return;
+    if (getLongLongFromObjectOrReply(c,o,&oldvalue,NULL) != C_OK) return;
+
+    if (o != NULL && oldvalue != expectedValue) {
+        addReplyErrorFormat(c,"original value was changed to '%lld'", oldvalue);
+        return;
+    }
+    if ((newValue < 0 && newValue < LLONG_MIN) ||
+        (newValue > 0 && newValue > LLONG_MAX)) {
+        addReplyError(c,"new value would overflow");
+        return;
+    }
+
+    new = createStringObjectFromLongLongForValue(newValue);
+    if (o) {
+        dbOverwrite(c->db,c->argv[1],new);
+    } else {
+        dbAdd(c->db,c->argv[1],new);
+    }
+
+    signalModifiedKey(c->db,c->argv[1]);
+    notifyKeyspaceEvent(NOTIFY_STRING,"cas",c->argv[1],c->db->id);
+    server.dirty++;
+    addReply(c,shared.colon);
+    addReply(c,new);
+    addReply(c,shared.crlf);
+}
+
+
+/* CAS key oldValue newValue */
+void compareAndSetCommand(client *c) {
+    int j;
+    long long expectedValue, newValue;
+    robj *expire = NULL;
+    int unit = UNIT_SECONDS;
+    int flags = OBJ_SET_NO_FLAGS;
+    int maxArgcIndex = c->argc-1;
+
+    if (maxArgcIndex >= 2){
+        c->argv[2] = tryObjectEncoding(c->argv[2]);
+        if (getLongLongFromObjectOrReply(c,c->argv[2],&expectedValue,NULL) != C_OK) return;
+    }
+    if (maxArgcIndex >= 3) {
+        c->argv[3] = tryObjectEncoding(c->argv[3]);
+        if (getLongLongFromObjectOrReply(c,c->argv[3],&newValue,NULL) != C_OK) return;
+    }
+
+    if (maxArgcIndex < 3) {
+        addReply(c,shared.syntaxerr);
+        return;
+    }
+
+
+    for (j = 4; j < c->argc; j++) {
+        char *a = c->argv[j]->ptr;
+        robj *next = (j == c->argc-1) ? NULL : c->argv[j+1];
+
+        if ((a[0] == 's' || a[0] == 'S') &&
+            (a[1] == 'e' || a[1] == 'E') &&
+            (a[2] == 't' || a[2] == 'T') && a[3] == '\0' )
+        {
+            flags |= OBJ_SET_NX;
+        } else if ((a[0] == 'x' || a[0] == 'X') &&
+                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
+                   !(flags & OBJ_SET_NX))
+        {
+            flags |= OBJ_SET_XX;
+        } else if ((a[0] == 'e' || a[0] == 'E') &&
+                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
+                   !(flags & OBJ_SET_PX) && next)
+        {
+            flags |= OBJ_SET_EX;
+            unit = UNIT_SECONDS;
+            expire = next;
+            j++;
+        } else if ((a[0] == 'p' || a[0] == 'P') &&
+                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
+                   !(flags & OBJ_SET_EX) && next)
+        {
+            flags |= OBJ_SET_PX;
+            unit = UNIT_MILLISECONDS;
+            expire = next;
+            j++;
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
+
+    compareAndSetGenericCommand(c, expectedValue, newValue);
+}
+
+
 void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire, int unit, robj *ok_reply, robj *abort_reply) {
     long long milliseconds = 0; /* initialized to avoid any harmness warning */
 
